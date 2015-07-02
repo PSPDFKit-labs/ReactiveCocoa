@@ -50,7 +50,7 @@ public final class Action<Input, Output, Error: ErrorType> {
 
 	/// Whether the action should be enabled for the given combination of user
 	/// enabledness and executing status.
-	private static func shouldBeEnabled(#userEnabled: Bool, executing: Bool) -> Bool {
+	private static func shouldBeEnabled(userEnabled userEnabled: Bool, executing: Bool) -> Bool {
 		return userEnabled && !executing
 	}
 
@@ -105,10 +105,10 @@ public final class Action<Input, Output, Error: ErrorType> {
 			self.executeClosure(input).startWithSignal { signal, signalDisposable in
 				disposable.addDisposable(signalDisposable)
 
-				signal.observe(Signal.Observer { event in
-					observer.put(event.mapError { .ProducerError($0) })
+				signal.observe { event in
+					observer(event.mapError { .ProducerError($0) })
 					sendNext(self.eventsObserver, event)
-				})
+				}
 			}
 
 			disposable.addDisposable {
@@ -156,7 +156,7 @@ public final class CocoaAction: NSObject {
 
 		super.init()
 
-		let enabledDisposable = action.enabled.producer
+		disposable += action.enabled.producer
 			|> observeOn(UIScheduler())
 			|> start(next: { [weak self] value in
 				self?.willChangeValueForKey("enabled")
@@ -164,17 +164,13 @@ public final class CocoaAction: NSObject {
 				self?.didChangeValueForKey("enabled")
 			})
 
-		disposable.addDisposable(enabledDisposable)
-
-		let executingDisposable = action.executing.producer
+		disposable += action.executing.producer
 			|> observeOn(UIScheduler())
 			|> start(next: { [weak self] value in
 				self?.willChangeValueForKey("executing")
 				self?._executing = value
 				self?.didChangeValueForKey("executing")
 			})
-
-		disposable.addDisposable(executingDisposable)
 	}
 
 	/// Initializes a Cocoa action that will invoke the given Action by
@@ -230,14 +226,14 @@ extension ActionError: ErrorType {
 	}
 }
 
-extension ActionError: Printable {
+extension ActionError: CustomStringConvertible {
 	public var description: String {
 		switch self {
 		case .NotEnabled:
 			return "Action executed while disabled"
 
 		case let .ProducerError(error):
-			return toString(error)
+			return String(error)
 		}
 	}
 }

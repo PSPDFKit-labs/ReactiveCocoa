@@ -6,7 +6,6 @@
 //  Copyright (c) 2015 GitHub. All rights reserved.
 //
 
-import Box
 import Result
 import Nimble
 import Quick
@@ -349,7 +348,7 @@ class SignalSpec: QuickSpec {
 				let (signal, sink) = Signal<Int, NoError>.pipe()
 
 				let test: () -> () = {
-					var innerStr: NSMutableString = NSMutableString()
+					let innerStr: NSMutableString = NSMutableString()
 					signal.observe(next: { value in
 						innerStr.appendString("\(value)")
 					})
@@ -371,7 +370,7 @@ class SignalSpec: QuickSpec {
 				let (signal, sink) = Signal<Int, NoError>.pipe()
 
 				let test: () -> () = {
-					var innerStr: NSMutableString = NSMutableString()
+					let innerStr: NSMutableString = NSMutableString()
 					signal.observe(next: { value in
 						innerStr.appendString("\(value)")
 					})
@@ -390,24 +389,26 @@ class SignalSpec: QuickSpec {
 				sendInterrupted(sink)
 				expect(testStr).to(beNil())
 			}
+		}
 
-			describe("trailing closure") {
-				it("receives next values") {
-					var values = [Int]()
-					let (signal, sink) = Signal<Int, NoError>.pipe()
+		describe("trailing closure") {
+			it("receives next values") {
+				var values = [Int]()
+				let (signal, sink) = Signal<Int, NoError>.pipe()
 
-					signal.observe { next in
-						values.append(next)
-					}
-
-					sendNext(sink, 1)
-					sendNext(sink, 2)
-					sendNext(sink, 3)
-
-					sendCompleted(sink)
-
-					expect(values).to(equal([1, 2, 3]))
+				signal.observe { next in
+					values.append(next)
 				}
+
+				sendNext(sink, 1)
+				expect(values).to(equal([1]))
+
+				signal |> observe { next in
+					values.append(next)
+				}
+
+				sendNext(sink, 2)
+				expect(values).to(equal([1, 2, 2]))
 			}
 		}
 
@@ -626,7 +627,7 @@ class SignalSpec: QuickSpec {
 
 			it("should skip values according to a predicate") {
 				let (baseSignal, sink) = Signal<String, NoError>.pipe()
-				let signal = baseSignal |> skipRepeats { count($0) == count($1) }
+				let signal = baseSignal |> skipRepeats { $0.characters.count == $1.characters.count }
 
 				var values: [String] = []
 				signal.observe(next: { values.append($0) })
@@ -714,7 +715,7 @@ class SignalSpec: QuickSpec {
 			
 			it("should complete immediately after taking given number of values") {
 				let numbers = [ 1, 2, 4, 4, 5 ]
-				var testScheduler = TestScheduler()
+				let testScheduler = TestScheduler()
 				
 				var signal: Signal<Int, NoError> = Signal { observer in
 					testScheduler.schedule {
@@ -737,7 +738,7 @@ class SignalSpec: QuickSpec {
 
 			it("should interrupt when 0") {
 				let numbers = [ 1, 2, 4, 4, 5 ]
-				var testScheduler = TestScheduler()
+				let testScheduler = TestScheduler()
 
 				let signal: Signal<Int, NoError> = Signal { observer in
 					testScheduler.schedule {
@@ -989,7 +990,7 @@ class SignalSpec: QuickSpec {
 		describe("delay") {
 			it("should send events on the given scheduler after the interval") {
 				let testScheduler = TestScheduler()
-				var signal: Signal<Int, NoError> = Signal { observer in
+				let signal: Signal<Int, NoError> = Signal { observer in
 					testScheduler.schedule {
 						sendNext(observer, 1)
 					}
@@ -1025,7 +1026,7 @@ class SignalSpec: QuickSpec {
 
 			it("should schedule errors immediately") {
 				let testScheduler = TestScheduler()
-				var signal: Signal<Int, TestError> = Signal { observer in
+				let signal: Signal<Int, TestError> = Signal { observer in
 					testScheduler.schedule {
 						sendError(observer, TestError.Default)
 					}
@@ -1291,8 +1292,8 @@ class SignalSpec: QuickSpec {
 				expect(latestEvent).toNot(beNil())
 				if let latestEvent = latestEvent {
 					switch latestEvent {
-					case let .Next(box):
-						expect(box.value).to(equal(2))
+					case let .Next(value):
+						expect(value).to(equal(2))
 					default:
 						fail()
 					}
@@ -1327,10 +1328,10 @@ class SignalSpec: QuickSpec {
 				
 				expect(result).to(beEmpty())
 				
-				sendNext(sink, IntEvent.Next(Box(2)))
+				sendNext(sink, .Next(2))
 				expect(result).to(equal([ 2 ]))
 				
-				sendNext(sink, IntEvent.Next(Box(4)))
+				sendNext(sink, .Next(4))
 				expect(result).to(equal([ 2, 4 ]))
 			}
 
@@ -1340,7 +1341,7 @@ class SignalSpec: QuickSpec {
 				
 				expect(errored).to(beFalsy())
 				
-				sendNext(sink, IntEvent.Error(Box(TestError.Default)))
+				sendNext(sink, .Error(TestError.Default))
 				expect(errored).to(beTruthy())
 			}
 
@@ -1460,10 +1461,10 @@ class SignalSpec: QuickSpec {
 			}
 		}
 
-		describe("try") {
+		describe("attempt") {
 			it("should forward original values upon success") {
 				let (baseSignal, sink) = Signal<Int, TestError>.pipe()
-				var signal = baseSignal |> try { _ in
+				let signal = baseSignal |> attempt { _ in
 					return .success()
 				}
 				
@@ -1480,7 +1481,7 @@ class SignalSpec: QuickSpec {
 			
 			it("should error if an attempt fails") {
 				let (baseSignal, sink) = Signal<Int, TestError>.pipe()
-				var signal = baseSignal |> try { _ in
+				let signal = baseSignal |> attempt { _ in
 					return .failure(.Default)
 				}
 				
@@ -1494,10 +1495,10 @@ class SignalSpec: QuickSpec {
 			}
 		}
 		
-		describe("tryMap") {
+		describe("attemptMap") {
 			it("should forward mapped values upon success") {
 				let (baseSignal, sink) = Signal<Int, TestError>.pipe()
-				var signal = baseSignal |> tryMap { num -> Result<Bool, TestError> in
+				let signal = baseSignal |> attemptMap { num -> Result<Bool, TestError> in
 					return .success(num % 2 == 0)
 				}
 				
@@ -1515,7 +1516,7 @@ class SignalSpec: QuickSpec {
 			
 			it("should error if a mapping fails") {
 				let (baseSignal, sink) = Signal<Int, TestError>.pipe()
-				var signal = baseSignal |> tryMap { _ -> Result<Bool, TestError> in
+				let signal = baseSignal |> attemptMap { _ -> Result<Bool, TestError> in
 					return .failure(.Default)
 				}
 				

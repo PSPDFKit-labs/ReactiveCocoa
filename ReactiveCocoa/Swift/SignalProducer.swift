@@ -53,10 +53,10 @@ public struct SignalProducer<T, E: ErrorType> {
 	public init(result: Result<T, E>) {
 		switch result {
 		case let .Success(value):
-			self.init(value: value.value)
+			self.init(value: value)
 
 		case let .Failure(error):
-			self.init(error: error.value)
+			self.init(error: error)
 		}
 	}
 
@@ -79,32 +79,34 @@ public struct SignalProducer<T, E: ErrorType> {
 	/// A producer for a Signal that will immediately complete without sending
 	/// any values.
 	public static var empty: SignalProducer {
-		return self { observer, disposable in
+		return self.init { observer, disposable in
 			sendCompleted(observer)
 		}
 	}
 
 	/// A producer for a Signal that never sends any events to its observers.
 	public static var never: SignalProducer {
-		return self { _ in () }
+		return self.init { _ in () }
 	}
 
-	/// Creates a buffer for Events, with the given capacity, and a
-	/// SignalProducer for a signal that will send Events from the buffer.
+	/// Creates a queue for events that replays them when new signals are
+	/// created from the returned producer.
 	///
-	/// When events are put into the returned observer (sink), they will be
-	/// added to the buffer. If the buffer is already at capacity, the earliest
-	/// (oldest) event will be dropped to make room for the new event.
+	/// When values are put into the returned observer (sink), they will be
+	/// added to an internal buffer. If the buffer is already at capacity, 
+	/// the earliest (oldest) value will be dropped to make room for the new
+	/// value.
 	///
 	/// Signals created from the returned producer will stay alive until a
-	/// terminating event is added to the buffer. If the buffer does not contain
-	/// such an event when the Signal is started, all events sent to the
+	/// terminating event is added to the queue. If the queue does not contain
+	/// such an event when the Signal is started, all values sent to the
 	/// returned observer will be automatically forwarded to the Signal’s
 	/// observers until a terminating event is received.
 	///
-	/// After a terminating event has been added to the buffer, the observer
-	/// will not add any further events.
-	public static func buffer(_ capacity: Int = Int.max) -> (SignalProducer, Signal<T, E>.Observer) {
+	/// After a terminating event has been added to the queue, the observer
+	/// will not add any further events. This _does not_ count against the
+	/// value capacity so no buffered values will be dropped on termination.
+	public static func buffer(capacity: Int = Int.max) -> (SignalProducer, Signal<T, E>.Observer) {
 		precondition(capacity >= 0)
 
 		let lock = NSLock()
@@ -114,37 +116,42 @@ public struct SignalProducer<T, E: ErrorType> {
 		var terminationEvent: Event<T,E>?
 		let observers: Atomic<Bag<Signal<T, E>.Observer>?> = Atomic(Bag())
 
-		let producer = self { observer, disposable in
+		let producer = self.init { observer, disposable in
 			lock.lock()
 
 			var token: RemovalToken?
-			observers.modify { (var observers) in
-				token = observers?.insert(observer)
+			observers.modify { observers in
+				guard var observers = observers else { return nil }
+				token = observers.insert(observer)
 				return observers
 			}
 
 			for event in events {
-				observer.put(event)
+				observer(event)
 			}
 
 			if let terminationEvent = terminationEvent {
-				observer.put(terminationEvent)
+				observer(terminationEvent)
 			}
 
 			lock.unlock()
 
 			if let token = token {
 				disposable.addDisposable {
-					observers.modify { (var observers) in
-						observers?.removeValueForToken(token)
+					observers.modify { observers in
+						guard var observers = observers else { return nil }
+
+						observers.removeValueForToken(token)
 						return observers
 					}
 				}
 			}
 		}
 
-		let bufferingObserver = Signal<T, E>.Observer { event in
-			let oldObservers = observers.modify { (var observers) in
+		let bufferingObserver: Signal<T, E>.Observer = { event in
+			lock.lock()
+			
+			let oldObservers = observers.modify { (observers) in
 				if event.isTerminating {
 					return nil
 				} else {
@@ -154,8 +161,6 @@ public struct SignalProducer<T, E: ErrorType> {
 
 			// If not disposed…
 			if let liveObservers = oldObservers {
-				lock.lock()
-
 				if event.isTerminating {
 					terminationEvent = event
 				} else {
@@ -166,11 +171,11 @@ public struct SignalProducer<T, E: ErrorType> {
 				}
 
 				for observer in liveObservers {
-					observer.put(event)
+					observer(event)
 				}
-
-				lock.unlock()
 			}
+			
+			lock.unlock()
 		}
 
 		return (producer, bufferingObserver)
@@ -182,8 +187,8 @@ public struct SignalProducer<T, E: ErrorType> {
 	/// Upon success, the started signal will send the resulting value then
 	/// complete. Upon failure, the started signal will send the error that
 	/// occurred.
-	public static func try(operation: () -> Result<T, E>) -> SignalProducer {
-		return self { observer, disposable in
+	public static func attempt(operation: () -> Result<T, E>) -> SignalProducer {
+		return self.init { observer, disposable in
 			operation().analysis(ifSuccess: { value in
 				sendNext(observer, value)
 				sendCompleted(observer)
@@ -218,8 +223,8 @@ public struct SignalProducer<T, E: ErrorType> {
 			return
 		}
 
-		let wrapperObserver = Signal<T, E>.Observer { event in
-			sink.put(event)
+		let wrapperObserver: Signal<T, E>.Observer = { event in
+			sink(event)
 
 			if event.isTerminating {
 				// Dispose only after notifying the Signal, so disposal
@@ -236,7 +241,7 @@ public struct SignalProducer<T, E: ErrorType> {
 	///
 	/// Returns a Disposable which can be used to interrupt the work associated
 	/// with the signal and immediately send an `Interrupted` event.
-	public func start<S: SinkType where S.Element == Event<T, E>>(sink: S) -> Disposable {
+	public func start(sink: Event<T, E>.Sink) -> Disposable {
 		var disposable: Disposable!
 
 		startWithSignal { signal, innerDisposable in
@@ -253,7 +258,7 @@ public struct SignalProducer<T, E: ErrorType> {
 	///
 	/// Returns a Disposable which can be used to interrupt the work associated
 	/// with the Signal, and prevent any future callbacks from being invoked.
-	public func start(error: (E -> ())? = nil, completed: (() -> ())? = nil, interrupted: (() -> ())? = nil, next: (T -> ())? = nil) -> Disposable {
+	public func start(error error: (E -> ())? = nil, completed: (() -> ())? = nil, interrupted: (() -> ())? = nil, next: (T -> ())? = nil) -> Disposable {
 		return start(Event.sink(next: next, error: error, completed: completed, interrupted: interrupted))
 	}
 
@@ -343,16 +348,15 @@ public func timer(interval: NSTimeInterval, onScheduler scheduler: DateScheduler
 	precondition(leeway >= 0)
 
 	return SignalProducer { observer, compositeDisposable in
-		let disposable = scheduler.scheduleAfter(scheduler.currentDate.dateByAddingTimeInterval(interval), repeatingEvery: interval, withLeeway: leeway) {
+		compositeDisposable += scheduler.scheduleAfter(scheduler.currentDate.dateByAddingTimeInterval(interval), repeatingEvery: interval, withLeeway: leeway) {
 			sendNext(observer, scheduler.currentDate)
 		}
-
-		compositeDisposable.addDisposable(disposable)
+		return ()
 	}
 }
 
 /// Injects side effects to be performed upon the specified signal events.
-public func on<T, E>(started: (() -> ())? = nil, event: (Event<T, E> -> ())? = nil, error: (E -> ())? = nil, completed: (() -> ())? = nil, interrupted: (() -> ())? = nil, terminated: (() -> ())? = nil, disposed: (() -> ())? = nil, next: (T -> ())? = nil) -> SignalProducer<T, E> -> SignalProducer<T, E> {
+public func on<T, E>(started started: (() -> ())? = nil, event: (Event<T, E> -> ())? = nil, error: (E -> ())? = nil, completed: (() -> ())? = nil, interrupted: (() -> ())? = nil, terminated: (() -> ())? = nil, disposed: (() -> ())? = nil, next: (T -> ())? = nil) -> SignalProducer<T, E> -> SignalProducer<T, E> {
 	return { producer in
 		return SignalProducer { observer, compositeDisposable in
 			started?()
@@ -361,15 +365,15 @@ public func on<T, E>(started: (() -> ())? = nil, event: (Event<T, E> -> ())? = n
 			producer.startWithSignal { signal, disposable in
 				compositeDisposable.addDisposable(disposable)
 
-				let innerObserver = Signal<T, E>.Observer { receivedEvent in
+				let innerObserver: Signal<T, E>.Observer = { receivedEvent in
 					event?(receivedEvent)
 
 					switch receivedEvent {
 					case let .Next(value):
-						next?(value.value)
+						next?(value)
 
 					case let .Error(err):
-						error?(err.value)
+						error?(err)
 
 					case .Completed:
 						completed?()
@@ -382,7 +386,7 @@ public func on<T, E>(started: (() -> ())? = nil, event: (Event<T, E> -> ())? = n
 						terminated?()
 					}
 
-					observer.put(receivedEvent)
+					observer(receivedEvent)
 				}
 
 				signal.observe(innerObserver)
@@ -401,14 +405,13 @@ public func on<T, E>(started: (() -> ())? = nil, event: (Event<T, E> -> ())? = n
 public func startOn<T, E>(scheduler: SchedulerType) -> SignalProducer<T, E> -> SignalProducer<T, E> {
 	return { producer in
 		return SignalProducer { observer, compositeDisposable in
-			let schedulerDisposable = scheduler.schedule {
+			compositeDisposable += scheduler.schedule {
 				producer.startWithSignal { signal, signalDisposable in
 					compositeDisposable.addDisposable(signalDisposable)
 					signal.observe(observer)
 				}
 			}
-
-			compositeDisposable.addDisposable(schedulerDisposable)
+			return ()
 		}
 	}
 }
@@ -453,7 +456,7 @@ public func combineLatest<A, B, Error>(a: SignalProducer<A, Error>, b: SignalPro
 /// Combines the values of all the given producers, in the manner described by
 /// `combineLatestWith`.
 public func combineLatest<A, B, C, Error>(a: SignalProducer<A, Error>, b: SignalProducer<B, Error>, c: SignalProducer<C, Error>) -> SignalProducer<(A, B, C), Error> {
-	return combineLatest(a, b)
+	return combineLatest(a, b: b)
 		|> combineLatestWith(c)
 		|> map(repack)
 }
@@ -461,7 +464,7 @@ public func combineLatest<A, B, C, Error>(a: SignalProducer<A, Error>, b: Signal
 /// Combines the values of all the given producers, in the manner described by
 /// `combineLatestWith`.
 public func combineLatest<A, B, C, D, Error>(a: SignalProducer<A, Error>, b: SignalProducer<B, Error>, c: SignalProducer<C, Error>, d: SignalProducer<D, Error>) -> SignalProducer<(A, B, C, D), Error> {
-	return combineLatest(a, b, c)
+	return combineLatest(a, b: b, c: c)
 		|> combineLatestWith(d)
 		|> map(repack)
 }
@@ -469,7 +472,7 @@ public func combineLatest<A, B, C, D, Error>(a: SignalProducer<A, Error>, b: Sig
 /// Combines the values of all the given producers, in the manner described by
 /// `combineLatestWith`.
 public func combineLatest<A, B, C, D, E, Error>(a: SignalProducer<A, Error>, b: SignalProducer<B, Error>, c: SignalProducer<C, Error>, d: SignalProducer<D, Error>, e: SignalProducer<E, Error>) -> SignalProducer<(A, B, C, D, E), Error> {
-	return combineLatest(a, b, c, d)
+	return combineLatest(a, b: b, c: c, d: d)
 		|> combineLatestWith(e)
 		|> map(repack)
 }
@@ -477,7 +480,7 @@ public func combineLatest<A, B, C, D, E, Error>(a: SignalProducer<A, Error>, b: 
 /// Combines the values of all the given producers, in the manner described by
 /// `combineLatestWith`.
 public func combineLatest<A, B, C, D, E, F, Error>(a: SignalProducer<A, Error>, b: SignalProducer<B, Error>, c: SignalProducer<C, Error>, d: SignalProducer<D, Error>, e: SignalProducer<E, Error>, f: SignalProducer<F, Error>) -> SignalProducer<(A, B, C, D, E, F), Error> {
-	return combineLatest(a, b, c, d, e)
+	return combineLatest(a, b: b, c: c, d: d, e: e)
 		|> combineLatestWith(f)
 		|> map(repack)
 }
@@ -485,7 +488,7 @@ public func combineLatest<A, B, C, D, E, F, Error>(a: SignalProducer<A, Error>, 
 /// Combines the values of all the given producers, in the manner described by
 /// `combineLatestWith`.
 public func combineLatest<A, B, C, D, E, F, G, Error>(a: SignalProducer<A, Error>, b: SignalProducer<B, Error>, c: SignalProducer<C, Error>, d: SignalProducer<D, Error>, e: SignalProducer<E, Error>, f: SignalProducer<F, Error>, g: SignalProducer<G, Error>) -> SignalProducer<(A, B, C, D, E, F, G), Error> {
-	return combineLatest(a, b, c, d, e, f)
+	return combineLatest(a, b: b, c: c, d: d, e: e, f: f)
 		|> combineLatestWith(g)
 		|> map(repack)
 }
@@ -493,7 +496,7 @@ public func combineLatest<A, B, C, D, E, F, G, Error>(a: SignalProducer<A, Error
 /// Combines the values of all the given producers, in the manner described by
 /// `combineLatestWith`.
 public func combineLatest<A, B, C, D, E, F, G, H, Error>(a: SignalProducer<A, Error>, b: SignalProducer<B, Error>, c: SignalProducer<C, Error>, d: SignalProducer<D, Error>, e: SignalProducer<E, Error>, f: SignalProducer<F, Error>, g: SignalProducer<G, Error>, h: SignalProducer<H, Error>) -> SignalProducer<(A, B, C, D, E, F, G, H), Error> {
-	return combineLatest(a, b, c, d, e, f, g)
+	return combineLatest(a, b: b, c: c, d: d, e: e, f: f, g: g)
 		|> combineLatestWith(h)
 		|> map(repack)
 }
@@ -501,7 +504,7 @@ public func combineLatest<A, B, C, D, E, F, G, H, Error>(a: SignalProducer<A, Er
 /// Combines the values of all the given producers, in the manner described by
 /// `combineLatestWith`.
 public func combineLatest<A, B, C, D, E, F, G, H, I, Error>(a: SignalProducer<A, Error>, b: SignalProducer<B, Error>, c: SignalProducer<C, Error>, d: SignalProducer<D, Error>, e: SignalProducer<E, Error>, f: SignalProducer<F, Error>, g: SignalProducer<G, Error>, h: SignalProducer<H, Error>, i: SignalProducer<I, Error>) -> SignalProducer<(A, B, C, D, E, F, G, H, I), Error> {
-	return combineLatest(a, b, c, d, e, f, g, h)
+	return combineLatest(a, b: b, c: c, d: d, e: e, f: f, g: g, h: h)
 		|> combineLatestWith(i)
 		|> map(repack)
 }
@@ -509,7 +512,7 @@ public func combineLatest<A, B, C, D, E, F, G, H, I, Error>(a: SignalProducer<A,
 /// Combines the values of all the given producers, in the manner described by
 /// `combineLatestWith`.
 public func combineLatest<A, B, C, D, E, F, G, H, I, J, Error>(a: SignalProducer<A, Error>, b: SignalProducer<B, Error>, c: SignalProducer<C, Error>, d: SignalProducer<D, Error>, e: SignalProducer<E, Error>, f: SignalProducer<F, Error>, g: SignalProducer<G, Error>, h: SignalProducer<H, Error>, i: SignalProducer<I, Error>, j: SignalProducer<J, Error>) -> SignalProducer<(A, B, C, D, E, F, G, H, I, J), Error> {
-	return combineLatest(a, b, c, d, e, f, g, h, i)
+	return combineLatest(a, b: b, c: c, d: d, e: e, f: f, g: g, h: h, i: i)
 		|> combineLatestWith(j)
 		|> map(repack)
 }
@@ -520,7 +523,7 @@ public func combineLatest<S: SequenceType, T, Error where S.Generator.Element ==
 	var generator = signalProducers.generate()
 	if let first = generator.next() {
 		let initial = first |> map { [$0] }
-		return reduce(GeneratorSequence(generator), initial) { $0 |> combineLatestWith($1) }
+		return GeneratorSequence(generator).reduce(initial) { $0 |> combineLatestWith($1) }
 	}
 	
 	return SignalProducer.empty
@@ -535,7 +538,7 @@ public func zip<A, B, Error>(a: SignalProducer<A, Error>, b: SignalProducer<B, E
 /// Zips the values of all the given producers, in the manner described by
 /// `zipWith`.
 public func zip<A, B, C, Error>(a: SignalProducer<A, Error>, b: SignalProducer<B, Error>, c: SignalProducer<C, Error>) -> SignalProducer<(A, B, C), Error> {
-	return zip(a, b)
+	return zip(a, b: b)
 		|> zipWith(c)
 		|> map(repack)
 }
@@ -543,7 +546,7 @@ public func zip<A, B, C, Error>(a: SignalProducer<A, Error>, b: SignalProducer<B
 /// Zips the values of all the given producers, in the manner described by
 /// `zipWith`.
 public func zip<A, B, C, D, Error>(a: SignalProducer<A, Error>, b: SignalProducer<B, Error>, c: SignalProducer<C, Error>, d: SignalProducer<D, Error>) -> SignalProducer<(A, B, C, D), Error> {
-	return zip(a, b, c)
+	return zip(a, b: b, c: c)
 		|> zipWith(d)
 		|> map(repack)
 }
@@ -551,7 +554,7 @@ public func zip<A, B, C, D, Error>(a: SignalProducer<A, Error>, b: SignalProduce
 /// Zips the values of all the given producers, in the manner described by
 /// `zipWith`.
 public func zip<A, B, C, D, E, Error>(a: SignalProducer<A, Error>, b: SignalProducer<B, Error>, c: SignalProducer<C, Error>, d: SignalProducer<D, Error>, e: SignalProducer<E, Error>) -> SignalProducer<(A, B, C, D, E), Error> {
-	return zip(a, b, c, d)
+	return zip(a, b: b, c: c, d: d)
 		|> zipWith(e)
 		|> map(repack)
 }
@@ -559,7 +562,7 @@ public func zip<A, B, C, D, E, Error>(a: SignalProducer<A, Error>, b: SignalProd
 /// Zips the values of all the given producers, in the manner described by
 /// `zipWith`.
 public func zip<A, B, C, D, E, F, Error>(a: SignalProducer<A, Error>, b: SignalProducer<B, Error>, c: SignalProducer<C, Error>, d: SignalProducer<D, Error>, e: SignalProducer<E, Error>, f: SignalProducer<F, Error>) -> SignalProducer<(A, B, C, D, E, F), Error> {
-	return zip(a, b, c, d, e)
+	return zip(a, b: b, c: c, d: d, e: e)
 		|> zipWith(f)
 		|> map(repack)
 }
@@ -567,7 +570,7 @@ public func zip<A, B, C, D, E, F, Error>(a: SignalProducer<A, Error>, b: SignalP
 /// Zips the values of all the given producers, in the manner described by
 /// `zipWith`.
 public func zip<A, B, C, D, E, F, G, Error>(a: SignalProducer<A, Error>, b: SignalProducer<B, Error>, c: SignalProducer<C, Error>, d: SignalProducer<D, Error>, e: SignalProducer<E, Error>, f: SignalProducer<F, Error>, g: SignalProducer<G, Error>) -> SignalProducer<(A, B, C, D, E, F, G), Error> {
-	return zip(a, b, c, d, e, f)
+	return zip(a, b: b, c: c, d: d, e: e, f: f)
 		|> zipWith(g)
 		|> map(repack)
 }
@@ -575,7 +578,7 @@ public func zip<A, B, C, D, E, F, G, Error>(a: SignalProducer<A, Error>, b: Sign
 /// Zips the values of all the given producers, in the manner described by
 /// `zipWith`.
 public func zip<A, B, C, D, E, F, G, H, Error>(a: SignalProducer<A, Error>, b: SignalProducer<B, Error>, c: SignalProducer<C, Error>, d: SignalProducer<D, Error>, e: SignalProducer<E, Error>, f: SignalProducer<F, Error>, g: SignalProducer<G, Error>, h: SignalProducer<H, Error>) -> SignalProducer<(A, B, C, D, E, F, G, H), Error> {
-	return zip(a, b, c, d, e, f, g)
+	return zip(a, b: b, c: c, d: d, e: e, f: f, g: g)
 		|> zipWith(h)
 		|> map(repack)
 }
@@ -583,7 +586,7 @@ public func zip<A, B, C, D, E, F, G, H, Error>(a: SignalProducer<A, Error>, b: S
 /// Zips the values of all the given producers, in the manner described by
 /// `zipWith`.
 public func zip<A, B, C, D, E, F, G, H, I, Error>(a: SignalProducer<A, Error>, b: SignalProducer<B, Error>, c: SignalProducer<C, Error>, d: SignalProducer<D, Error>, e: SignalProducer<E, Error>, f: SignalProducer<F, Error>, g: SignalProducer<G, Error>, h: SignalProducer<H, Error>, i: SignalProducer<I, Error>) -> SignalProducer<(A, B, C, D, E, F, G, H, I), Error> {
-	return zip(a, b, c, d, e, f, g, h)
+	return zip(a, b: b, c: c, d: d, e: e, f: f, g: g, h: h)
 		|> zipWith(i)
 		|> map(repack)
 }
@@ -591,7 +594,7 @@ public func zip<A, B, C, D, E, F, G, H, I, Error>(a: SignalProducer<A, Error>, b
 /// Zips the values of all the given producers, in the manner described by
 /// `zipWith`.
 public func zip<A, B, C, D, E, F, G, H, I, J, Error>(a: SignalProducer<A, Error>, b: SignalProducer<B, Error>, c: SignalProducer<C, Error>, d: SignalProducer<D, Error>, e: SignalProducer<E, Error>, f: SignalProducer<F, Error>, g: SignalProducer<G, Error>, h: SignalProducer<H, Error>, i: SignalProducer<I, Error>, j: SignalProducer<J, Error>) -> SignalProducer<(A, B, C, D, E, F, G, H, I, J), Error> {
-	return zip(a, b, c, d, e, f, g, h, i)
+	return zip(a, b: b, c: c, d: d, e: e, f: f, g: g, h: h, i: i)
 		|> zipWith(j)
 		|> map(repack)
 }
@@ -602,7 +605,7 @@ public func zip<S: SequenceType, T, Error where S.Generator.Element == SignalPro
 	var generator = signalProducers.generate()
 	if let first = generator.next() {
 		let initial = first |> map { [$0] }
-		return reduce(GeneratorSequence(generator), initial) { $0 |> zipWith($1) }
+		return GeneratorSequence(generator).reduce(initial) { $0 |> zipWith($1) }
 	}
 	
 	return SignalProducer.empty
@@ -642,9 +645,9 @@ public func takeUntilReplacement<T, E>(replacement: SignalProducer<T, E>) -> Sig
 	}
 }
 
-/// Catches any error that may occur on the input producer, then starts a new
-/// producer in its place.
-public func catch<T, E, F>(handler: E -> SignalProducer<T, F>) -> SignalProducer<T, E> -> SignalProducer<T, F> {
+/// Catches any error that may occur on the input producer, mapping to a new producer
+/// that starts in its place.
+public func flatMapError<T, E, F>(handler: E -> SignalProducer<T, F>) -> SignalProducer<T, E> -> SignalProducer<T, F> {
 	return { producer in
 		return SignalProducer { observer, disposable in
 			let serialDisposable = SerialDisposable()
@@ -670,11 +673,6 @@ public func catch<T, E, F>(handler: E -> SignalProducer<T, F>) -> SignalProducer
 	}
 }
 
-/// Create a fix point to enable recursive calling of a closure.
-private func fix<T, U>(f: (T -> U) -> T -> U) -> T -> U {
-	return { f(fix(f))($0) }
-}
-
 /// `concat`s `next` onto `producer`.
 public func concat<T, E>(next: SignalProducer<T, E>) -> SignalProducer<T, E> -> SignalProducer<T, E> {
 	return { producer in
@@ -698,25 +696,23 @@ public func times<T, E>(count: Int) -> SignalProducer<T, E> -> SignalProducer<T,
 			let serialDisposable = SerialDisposable()
 			disposable.addDisposable(serialDisposable)
 
-			let iterate: Int -> () = fix { recur in
-				{ current in
-					producer.startWithSignal { signal, signalDisposable in
-						serialDisposable.innerDisposable = signalDisposable
+			func iterate(current: Int) {
+				producer.startWithSignal { signal, signalDisposable in
+					serialDisposable.innerDisposable = signalDisposable
 
-						signal.observe(Signal.Observer { event in
-							switch event {
-							case .Completed:
-								let remainingTimes = current - 1
-								if remainingTimes > 0 {
-									recur(remainingTimes)
-								} else {
-									sendCompleted(observer)
-								}
-
-							default:
-								observer.put(event)
+					signal.observe { event in
+						switch event {
+						case .Completed:
+							let remainingTimes = current - 1
+							if remainingTimes > 0 {
+								iterate(remainingTimes)
+							} else {
+								sendCompleted(observer)
 							}
-						})
+
+						default:
+							observer(event)
+						}
 					}
 				}
 			}
@@ -734,7 +730,7 @@ public func retry<T, E>(count: Int) -> SignalProducer<T, E> -> SignalProducer<T,
 		if count == 0 {
 			return producer
 		} else {
-			return producer |> catch { _ in
+			return producer |> flatMapError { _ in
 				producer |> retry(count - 1)
 			}
 		}
@@ -786,7 +782,6 @@ public func single<T, E>(producer: SignalProducer<T, E>) -> Result<T, E>? {
 				result = nil
 				return
 			}
-
 			result = .success(value)
 		}, error: { error in
 			result = .failure(error)
@@ -820,14 +815,14 @@ public func startWithSignal<T, E>(setUp: (Signal<T, E>, Disposable) -> ()) -> Si
 }
 
 /// SignalProducer.start() as a free function, for easier use with |>.
-public func start<T, E, S: SinkType where S.Element == Event<T, E>>(sink: S) -> SignalProducer<T, E> -> Disposable {
+public func start<T, E>(sink: Event<T, E>.Sink) -> SignalProducer<T, E> -> Disposable {
 	return { producer in
 		return producer.start(sink)
 	}
 }
 
 /// SignalProducer.start() as a free function, for easier use with |>.
-public func start<T, E>(error: (E -> ())? = nil, completed: (() -> ())? = nil, interrupted: (() -> ())? = nil, next: (T -> ())? = nil) -> SignalProducer<T, E> -> Disposable {
+public func start<T, E>(error error: (E -> ())? = nil, completed: (() -> ())? = nil, interrupted: (() -> ())? = nil, next: (T -> ())? = nil) -> SignalProducer<T, E> -> Disposable {
 	return { producer in
 		return producer.start(next: next, error: error, completed: completed, interrupted: interrupted)
 	}
@@ -855,7 +850,7 @@ public enum FlattenStrategy: Equatable {
 	case Latest
 }
 
-extension FlattenStrategy: Printable {
+extension FlattenStrategy: CustomStringConvertible {
 	public var description: String {
 		switch self {
 		case .Merge:
@@ -1000,7 +995,7 @@ private final class ConcatState<T, E: ErrorType> {
 		signalProducer.startWithSignal { signal, disposable in
 			let handle = self.disposable.addDisposable(disposable)
 
-			signal.observe(Signal.Observer { event in
+			signal.observe { event in
 				switch event {
 				case .Completed, .Interrupted:
 					handle.remove()
@@ -1010,9 +1005,9 @@ private final class ConcatState<T, E: ErrorType> {
 					}
 
 				default:
-					self.observer.put(event)
+					self.observer(event)
 				}
-			})
+			}
 		}
 	}
 }
@@ -1038,7 +1033,7 @@ private func merge<T, E>(producer: SignalProducer<SignalProducer<T, E>, E>) -> S
 
 					let handle = disposable.addDisposable(innerDisposable)
 
-					innerSignal.observe(Signal<T,E>.Observer { event in
+					innerSignal.observe { event in
 						switch event {
 						case .Completed, .Interrupted:
 							if event.isTerminating {
@@ -1048,9 +1043,9 @@ private func merge<T, E>(producer: SignalProducer<SignalProducer<T, E>, E>) -> S
 							decrementInFlight()
 
 						default:
-							relayObserver.put(event)
+							relayObserver(event)
 						}
-					})
+					}
 				}
 			}, error: { error in
 				sendError(relayObserver, error)
@@ -1098,7 +1093,7 @@ private func switchToLatest<T, E>(producer: SignalProducer<SignalProducer<T, E>,
 						return state
 					}
 
-					innerSignal.observe(Signal.Observer { event in
+					innerSignal.observe { event in
 						switch event {
 						case .Interrupted:
 							// If interruption occurred as a result of a new signal
@@ -1126,9 +1121,9 @@ private func switchToLatest<T, E>(producer: SignalProducer<SignalProducer<T, E>,
 							}
 
 						default:
-							sink.put(event)
+							sink(event)
 						}
-					})
+					}
 				}
 			}, error: { error in
 				sendError(sink, error)

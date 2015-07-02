@@ -8,7 +8,6 @@
 
 import Foundation
 
-import Box
 import Result
 import Nimble
 import Quick
@@ -44,17 +43,17 @@ class SignalProducerSpec: QuickSpec {
 					}
 				}
 
-				weak var testSink: TestSink?
+				weak var objectRetainedByObserver: NSObject?
 				producer.startWithSignal { signal, _ in
-					var sink = TestSink()
-					testSink = sink
-					signal.observe(sink)
+					let object = NSObject()
+					objectRetainedByObserver = object
+					signal.observe { _ in object }
 				}
 
-				expect(testSink).toNot(beNil())
+				expect(objectRetainedByObserver).toNot(beNil())
 
 				disposable.dispose()
-				expect(testSink).to(beNil())
+				expect(objectRetainedByObserver).to(beNil())
 			}
 
 			it("should dispose of added disposables upon completion") {
@@ -274,7 +273,27 @@ class SignalProducerSpec: QuickSpec {
 			}
 		}
 
-		describe("SignalProducer.try") {
+		describe("trailing closure") {
+			it("receives next values") {
+				var values = [Int]()
+				let (producer, sink) = SignalProducer<Int, NoError>.buffer(1)
+				sendNext(sink, 1)
+
+				producer.start { next in
+					values.append(next)
+				}
+
+				expect(values).to(equal([1]))
+
+				producer |> start { next in
+					values.append(next)
+				}
+
+				expect(values).to(equal([1, 1]))
+			}
+		}
+
+		describe("SignalProducer.attempt") {
 			it("should run the operation once per start()") {
 				var operationRunTimes = 0
 				let operation: () -> Result<String, NSError> = {
@@ -283,8 +302,8 @@ class SignalProducerSpec: QuickSpec {
 					return .success("OperationValue")
 				}
 
-				SignalProducer.try(operation).start()
-				SignalProducer.try(operation).start()
+				SignalProducer.attempt(operation).start()
+				SignalProducer.attempt(operation).start()
 
 				expect(operationRunTimes).to(equal(2))
 			}
@@ -295,7 +314,7 @@ class SignalProducerSpec: QuickSpec {
 					return .success(operationReturnValue)
 				}
 
-				let signalProducer = SignalProducer.try(operation)
+				let signalProducer = SignalProducer.attempt(operation)
 
 				expect(signalProducer).to(sendValue(operationReturnValue, sendError: nil, complete: true))
 			}
@@ -306,7 +325,7 @@ class SignalProducerSpec: QuickSpec {
 					return .failure(operationError)
 				}
 
-				let signalProducer = SignalProducer.try(operation)
+				let signalProducer = SignalProducer.attempt(operation)
 
 				expect(signalProducer).to(sendValue(nil, sendError: operationError, complete: false))
 			}
@@ -372,22 +391,21 @@ class SignalProducerSpec: QuickSpec {
 			}
 
 			it("should release signal observers if disposed") {
-				weak var testSink: TestSink?
+				weak var objectRetainedByObserver: NSObject?
 				var disposable: Disposable!
 
 				let producer = SignalProducer<Int, NoError>.never
 				producer.startWithSignal { signal, innerDisposable in
-					var sink = TestSink()
-					testSink = sink
-					signal.observe(sink)
-
+					let object = NSObject()
+					objectRetainedByObserver = object
+					signal.observe { _ in object }
 					disposable = innerDisposable
 				}
 
-				expect(testSink).toNot(beNil())
+				expect(objectRetainedByObserver).toNot(beNil())
 
 				disposable.dispose()
-				expect(testSink).to(beNil())
+				expect(objectRetainedByObserver).to(beNil())
 			}
 
 			it("should not trigger effects if disposed before closure return") {
@@ -492,22 +510,20 @@ class SignalProducerSpec: QuickSpec {
 			}
 
 			it("should release sink when disposed") {
-				weak var testSink: TestSink?
-
+				weak var objectRetainedByObserver: NSObject?
 				var disposable: Disposable!
-				var test: () -> () = {
+				let test: () -> () = {
 					let producer = SignalProducer<Int, NoError>.never
-					let sink = TestSink()
-					testSink = sink
-
-					disposable = producer.start(sink)
+					let object = NSObject()
+					objectRetainedByObserver = object
+					disposable = producer.start { _ in object }
 				}
 
 				test()
-				expect(testSink).toNot(beNil())
+				expect(objectRetainedByObserver).toNot(beNil())
 
 				disposable.dispose()
-				expect(testSink).to(beNil())
+				expect(objectRetainedByObserver).to(beNil())
 			}
 
 			describe("trailing closure") {
@@ -515,9 +531,9 @@ class SignalProducerSpec: QuickSpec {
 					var values = [Int]()
 					let (producer, sink) = SignalProducer<Int, NoError>.buffer()
 
-					producer.start { next in
+					producer.start(next: { next in
 						values.append(next)
-					}
+					})
 
 					sendNext(sink, 1)
 					sendNext(sink, 2)
@@ -747,7 +763,7 @@ class SignalProducerSpec: QuickSpec {
 			}
 		}
 
-		describe("catch") {
+		describe("flatMapError") {
 			it("should invoke the handler and start new producer for an error") {
 				let (baseProducer, baseSink) = SignalProducer<Int, TestError>.buffer()
 				sendNext(baseSink, 1)
@@ -757,7 +773,7 @@ class SignalProducerSpec: QuickSpec {
 				var completed = false
 
 				baseProducer
-					|> catch { (error: TestError) -> SignalProducer<Int, TestError> in
+					|> flatMapError { (error: TestError) -> SignalProducer<Int, TestError> in
 						expect(error).to(equal(TestError.Default))
 						expect(values).to(equal([1]))
 
@@ -1184,7 +1200,7 @@ class SignalProducerSpec: QuickSpec {
 					.failure(.Default)
 				]
 
-				let original = SignalProducer.tryWithResults(results)
+				let original = SignalProducer.attemptWithResults(results)
 				let producer = original |> times(3)
 
 				let events = producer
@@ -1194,9 +1210,9 @@ class SignalProducerSpec: QuickSpec {
 				let result = events?.value
 
 				let expectedEvents: [Event<Int, TestError>] = [
-					.Next(Box(1)),
-					.Next(Box(2)),
-					.Error(Box(.Default))
+					.Next(1),
+					.Next(2),
+					.Error(.Default)
 				]
 
 				// TODO: if let result = result where result.count == expectedEvents.count
@@ -1228,7 +1244,7 @@ class SignalProducerSpec: QuickSpec {
 					.success(1)
 				]
 
-				let original = SignalProducer.tryWithResults(results)
+				let original = SignalProducer.attemptWithResults(results)
 				let producer = original |> retry(2)
 
 				let result = producer |> single
@@ -1243,7 +1259,7 @@ class SignalProducerSpec: QuickSpec {
 					.failure(.Error2),
 				]
 
-				let original = SignalProducer.tryWithResults(results)
+				let original = SignalProducer.attemptWithResults(results)
 				let producer = original |> retry(2)
 
 				let result = producer |> single
@@ -1258,7 +1274,7 @@ class SignalProducerSpec: QuickSpec {
 					.success(3)
 				]
 
-				let original = SignalProducer.tryWithResults(results)
+				let original = SignalProducer.attemptWithResults(results)
 				let producer = original |> retry(2)
 
 				let result = producer |> single
@@ -1470,16 +1486,11 @@ class SignalProducerSpec: QuickSpec {
 	}
 }
 
-/// Observer that can be weakly captured to monitor its lifetime
-private final class TestSink : SinkType {
-	func put(x: Event<Int, NoError>) {}
-}
-
 extension SignalProducer {
 	/// Creates a producer that can be started as many times as elements in `results`.
 	/// Each signal will immediately send either a value or an error.
-	private static func tryWithResults<C: CollectionType where C.Generator.Element == Result<T, E>, C.Index.Distance == Int>(results: C) -> SignalProducer<T, E> {
-		let resultCount = count(results)
+	private static func attemptWithResults<C: CollectionType where C.Generator.Element == Result<T, E>, C.Index.Distance == Int>(results: C) -> SignalProducer<T, E> {
+		let resultCount = results.count
 		var operationIndex = 0
 
 		precondition(resultCount > 0)
@@ -1494,6 +1505,6 @@ extension SignalProducer {
 			}
 		}
 
-		return SignalProducer.try(operation)
+		return SignalProducer.attempt(operation)
 	}
 }

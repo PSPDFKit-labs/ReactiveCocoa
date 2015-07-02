@@ -45,11 +45,11 @@ extension QueueScheduler {
 	}
 }
 
-private func defaultNSError(message: String, #file: String, #line: Int) -> NSError {
+private func defaultNSError(message: String, file: String, line: Int) -> NSError {
 	let error = Result<(), NSError>.error(file: file, line: line)
 
 	var userInfo = error.userInfo
-	userInfo?[NSLocalizedDescriptionKey] = message
+	userInfo[NSLocalizedDescriptionKey] = message
 
 	return NSError(domain: error.domain, code: error.code, userInfo: userInfo)
 }
@@ -71,8 +71,7 @@ extension RACSignal {
 				sendCompleted(observer)
 			}
 
-			let selfDisposable: RACDisposable? = self.subscribeNext(next, error: error, completed: completed)
-			disposable.addDisposable(selfDisposable)
+			disposable += self.subscribeNext(next, error: error, completed: completed)
 		}
 	}
 }
@@ -147,14 +146,14 @@ extension RACCommand {
 
 		enabledProperty <~ self.enabled.toSignalProducer()
 			|> map { $0 as! Bool }
-			|> catch { _ in SignalProducer<Bool, NoError>(value: false) }
+			|> flatMapError { _ in SignalProducer<Bool, NoError>(value: false) }
 
 		return Action(enabledIf: enabledProperty) { (input: AnyObject?) -> SignalProducer<AnyObject?, NSError> in
-			let executionSignal = RACSignal.defer {
+			let executionSignal = RACSignal.`defer` {
 				return self.execute(input)
 			}
 
-			return executionSignal.toSignalProducer(file: file, line: line)
+			return executionSignal.toSignalProducer(file, line: line)
 		}
 	}
 }
